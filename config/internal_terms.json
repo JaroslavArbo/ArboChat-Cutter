@@ -1,0 +1,75 @@
+{
+  "terms": [
+    {
+      "label": "Arboristická akademie",
+      "variants": [
+        "Arboristická akademie",
+        "arboristická akademie"
+      ],
+      "action": "mark"
+    },
+    {
+      "label": "áčka",
+      "variants": [
+        "áčka",
+        "ačka",
+        "Áčka",
+        "Ačka"
+      ],
+      "action": "mark"
+    },
+    {
+      "label": "szkt",
+      "variants": [
+        "szkt",
+        "SZKT"
+      ],
+      "action": "mark"
+    },
+    {
+      "label": "sekce",
+      "variants": [
+        "sekce",
+        "Sekce"
+      ],
+      "action": "mark"
+    },
+    {
+      "label": "vystřihni",
+      "variants": [
+        "vystřihni",
+        "vystrihni"
+      ],
+      "action": "suggest_cut"
+    },
+    {
+      "label": "vystřihnout",
+      "variants": [
+        "vystřihnout",
+        "vystrihnout"
+      ],
+      "action": "suggest_cut"
+    },
+    {
+      "label": "Jarek",
+      "variants": [
+        "Jarek"
+      ],
+      "action": "mark"
+    },
+    {
+      "label": "Jarka",
+      "variants": [
+        "Jarka"
+      ],
+      "action": "mark"
+    },
+    {
+      "label": "Jarkovi",
+      "variants": [
+        "Jarkovi"
+      ],
+      "action": "mark"
+    }
+  ]
+}
