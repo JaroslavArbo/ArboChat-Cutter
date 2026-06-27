@@ -1,0 +1,39 @@
+# Python
+__pycache__/
+*.pyc
+.venv/
+venv/
+
+# Node / Vite
+node_modules/
+frontend/node_modules/
+frontend/.vite/
+web/
+dist/
+build/
+
+# ArboChat working data - never commit working videos/projects
+projects/
+exports/
+work/
+tmp/
+temp/
+
+# Large media and generated outputs
+*.mp4
+*.mov
+*.m4a
+*.mp3
+*.wav
+*.aac
+*.zip
+
+# Keep only tiny config examples in Git
+!config/topics_example.csv
+!config/internal_terms.json
+
+# macOS
+.DS_Store
+
+# Logs
+*.log
