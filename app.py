@@ -5,7 +5,8 @@
 from http.server import ThreadingHTTPServer, BaseHTTPRequestHandler
 from pathlib import Path
 import json
-import base64, os, re, shutil, subprocess, csv, mimetypes, urllib.parse, uuid, datetime, html, wave, math, struct, base64
+import base64, os, re, shutil, subprocess, csv, mimetypes, urllib.parse, uuid, datetime, html, wave, math, struct, base64, hashlib
+from concurrent.futures import ThreadPoolExecutor
 
 ROOT = Path(__file__).resolve().parent
 WEB = ROOT / "web"
@@ -100,15 +101,76 @@ def run(cmd):
     p = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
     return p.returncode, p.stdout, p.stderr
 
+_FILTER_CACHE = {}
+
 def ffmpeg_has_filter(name):
+    if name in _FILTER_CACHE:
+        return _FILTER_CACHE[name]
     try:
         p = subprocess.run(["ffmpeg", "-hide_banner", "-filters"], stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
         data = (p.stdout or "") + (p.stderr or "")
-        return name in data
     except Exception:
-        return False
+        data = ""
+    result = name in data
+    _FILTER_CACHE[name] = result
+    return result
+
+_HWENC_CACHE = {}
+
+def hw_video_encoder():
+    """Return ('h264_videotoolbox', extra_args) if usable on this machine, else None.
+
+    Cached for the process lifetime: the result depends only on the local ffmpeg
+    build/hardware, not on any per-call state.
+    """
+    if "videotoolbox" not in _HWENC_CACHE:
+        usable = False
+        try:
+            p = subprocess.run(["ffmpeg", "-hide_banner", "-encoders"], stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+            data = (p.stdout or "") + (p.stderr or "")
+            usable = "h264_videotoolbox" in data
+        except Exception:
+            usable = False
+        _HWENC_CACHE["videotoolbox"] = usable
+    return _HWENC_CACHE["videotoolbox"]
+
+def video_encode_args(crf="20", vt_bitrate="9M"):
+    """Video encoder args shared by every segment-building helper.
+
+    Prefers the macOS hardware encoder (several times faster than software x264
+    for 1080p30 and plenty good enough for a cut/trim tool), falling back to the
+    previous libx264 settings whenever videotoolbox is unavailable so behavior on
+    non-mac builds/ffmpeg without it is unchanged. `vt_bitrate` should be lowered
+    by callers encoding at less than Full HD (e.g. small previews) so hardware
+    mode doesn't waste bitrate/time on a low-resolution frame.
+    """
+    if hw_video_encoder():
+        # videotoolbox has no CRF; approximate visual quality with a bitrate
+        # ceiling similar to what the equivalent libx264 crf produced.
+        value = "".join(ch for ch in str(vt_bitrate) if ch.isdigit()) or "9"
+        unit = "".join(ch for ch in str(vt_bitrate) if ch.isalpha()) or "M"
+        base = int(value)
+        return ["-c:v", "h264_videotoolbox", "-b:v", f"{base}{unit}", "-maxrate", f"{int(base*1.35)}{unit}", "-bufsize", f"{base*2}{unit}"]
+    return ["-c:v", "libx264", "-preset", "veryfast", "-crf", str(crf)]
+
+_PROBE_CACHE = {}
 
 def ffprobe(path):
+    """ffprobe with an in-process cache keyed by (path, mtime, size).
+
+    The same intro/outro/speaker/gallery/replacement files get probed many times
+    across one compose+render pass; the underlying file cannot change mid-run, so
+    caching removes dozens of redundant subprocess spawns per export with no
+    behavior change.
+    """
+    key = str(path)
+    try:
+        st = os.stat(key)
+        cache_key = (key, st.st_mtime_ns, st.st_size)
+    except OSError:
+        cache_key = None
+    if cache_key is not None and cache_key in _PROBE_CACHE:
+        return _PROBE_CACHE[cache_key]
     cmd = ["ffprobe", "-v", "error", "-print_format", "json", "-show_format", "-show_streams", str(path)]
     code, out, err = run(cmd)
     if code != 0:
@@ -138,7 +200,28 @@ def ffprobe(path):
                 "channels": s.get("channels"),
                 "sample_rate": s.get("sample_rate")
             }
+    if cache_key is not None:
+        _PROBE_CACHE[cache_key] = info
     return info
+
+def _is_full_hd_h264_aac(info):
+    """True if an ffprobe() result already matches the app's Full HD render spec.
+
+    Used to skip a redundant re-encode when a file (e.g. the edit master) was
+    already produced by this app's own normalization pipeline.
+    """
+    video = info.get("video") or {}
+    audio = info.get("audio") or {}
+    try:
+        if str(video.get("codec") or "") != "h264":
+            return False
+        if int(video.get("width") or 0) != 1920 or int(video.get("height") or 0) != 1080:
+            return False
+        if str(audio.get("codec") or "") != "aac":
+            return False
+    except Exception:
+        return False
+    return True
 
 def parse_time_to_seconds(s):
     if not s: return None
@@ -912,7 +995,7 @@ def _make_video_preview(pid, t, seconds=5, role=None):
     if not out.exists():
         cmd = [
             "ffmpeg", "-y", "-hide_banner", "-ss", str(start), "-i", str(src), "-t", str(max(1, seconds)),
-            "-vf", "scale=960:-2,format=yuv420p", "-c:v", "libx264", "-preset", "veryfast", "-crf", "24",
+            "-vf", "scale=960:-2,format=yuv420p", *video_encode_args("24", vt_bitrate="3M"),
             "-c:a", "aac", "-b:a", "128k", "-movflags", "+faststart", str(out)
         ]
         code, so, se = run(cmd)
@@ -1138,17 +1221,37 @@ def _analyze_project(pid):
 
     markers = []
     markers.extend(detect_optimized_start_from_transcript(entries))
-    try:
-        if files.get("speaker_video"):
-            markers.extend(detect_lecture_start_by_audio(files.get("speaker_video"), project_dir(pid) / "work"))
-    except Exception as e:
-        markers.append({"label":"Audio start: chyba", "kind":"warning", "start":0, "end":0, "text":str(e)})
+
+    # These three audio scans each do their own full ffmpeg decode pass over the
+    # same speaker video and don't depend on each other's output, so they used to
+    # run back-to-back on the request thread. Running them concurrently (they are
+    # subprocess/IO bound, so the GIL isn't a bottleneck) cuts wall-clock time for
+    # this step roughly to the slowest single scan instead of the sum of all three.
+    # Marker order doesn't matter: everything is sorted by start/end time below.
+    speaker_video = files.get("speaker_video")
+    if speaker_video:
+        work_dir = project_dir(pid) / "work"
+        audio_tasks = {
+            "lecture_start": lambda: detect_lecture_start_by_audio(speaker_video, work_dir),
+            "silences": lambda: analyze_silences(speaker_video),
+            "inserted": lambda: detect_inserted_video_by_audio(speaker_video, work_dir),
+        }
+        with ThreadPoolExecutor(max_workers=len(audio_tasks)) as pool:
+            futures = {pool.submit(fn): name for name, fn in audio_tasks.items()}
+            audio_results = {}
+            for fut in futures:
+                name = futures[fut]
+                try:
+                    audio_results[name] = fut.result() or []
+                except Exception as e:
+                    audio_results[name] = [{"label": "Audio start: chyba", "kind": "warning", "start": 0, "end": 0, "text": str(e)}]
+        markers.extend(audio_results.get("lecture_start") or [])
+        markers.extend(audio_results.get("silences") or [])
+        markers.extend(audio_results.get("inserted") or [])
+
     markers.extend(find_phrase_entries(entries, [r"vid[ií]te.*prezentaci", r"je vid[eě]t.*prezentace", r"sd[ií]len[íi] obrazovky"], "Kontrola viditelnosti prezentace", "presentation_check"))
     markers.extend(find_phrase_entries(entries, [r"dotazy", r"diskuse", r"ot[aá]zky", r"m[uů][zž]ete se pt[aá]t"], "Kandidát začátku diskuse", "discussion"))
     markers.extend(detect_terms(entries))
-    if files.get("speaker_video"):
-        markers.extend(analyze_silences(files.get("speaker_video")))
-        markers.extend(detect_inserted_video_by_audio(files.get("speaker_video"), project_dir(pid) / "work"))
 
     # Safe fallbacks from current known workflow.
     if not any(m.get("kind") == "replacement" for m in markers):
@@ -1295,14 +1398,14 @@ def _normalized_segment(src, start, duration, target):
     if _media_has_audio(src):
         cmd = base + [
             "-map", "0:v:0", "-map", "0:a:0?",
-            "-vf", vf, "-r", "30", "-c:v", "libx264", "-preset", "veryfast", "-crf", "20",
+            "-vf", vf, "-r", "30", *video_encode_args("20"),
             "-c:a", "aac", "-b:a", "192k", "-ar", "48000", "-ac", "2", "-shortest", str(target)
         ]
     else:
         cmd = base + [
             "-f", "lavfi", "-i", f"anullsrc=channel_layout=stereo:sample_rate=48000:d={_ffmpeg_time(seg_dur)}",
             "-map", "0:v:0", "-map", "1:a:0",
-            "-vf", vf, "-r", "30", "-c:v", "libx264", "-preset", "veryfast", "-crf", "20",
+            "-vf", vf, "-r", "30", *video_encode_args("20"),
             "-c:a", "aac", "-b:a", "192k", "-ar", "48000", "-ac", "2", "-shortest", str(target)
         ]
     code, so, se = run(cmd)
@@ -1374,7 +1477,7 @@ def _overlay_timeline_segment(base_src, overlay_src, base_start, overlay_start, 
     cmd += [
         "-filter_complex", vf,
         "-map", "[v]", *audio_map,
-        "-r", "30", "-c:v", "libx264", "-preset", "veryfast", "-crf", "20",
+        "-r", "30", *video_encode_args("20"),
         "-c:a", "aac", "-b:a", "192k", "-ar", "48000", "-ac", "2",
         "-shortest", str(target)
     ]
@@ -1665,20 +1768,51 @@ def _overlay_png_on_video(src, overlay_png, target, duration=None, crf="22"):
     else:
         dur = duration or 5.0
         cmd += ["-f", "lavfi", "-i", f"anullsrc=channel_layout=stereo:sample_rate=48000:d={dur}", "-map", "2:a:0"]
-    cmd += ["-r", "30", "-c:v", "libx264", "-preset", "veryfast", "-crf", str(crf), "-c:a", "aac", "-b:a", "160k", "-shortest", str(target)]
+    cmd += ["-r", "30", *video_encode_args(crf), "-c:a", "aac", "-b:a", "160k", "-shortest", str(target)]
     code, so, se = run(cmd)
     if code == 0 and target.exists():
         return target
     return None
 
 
+def _outro_cache_key(src, overlay):
+    try:
+        parts = []
+        for p in (Path(src), overlay):
+            st = p.stat()
+            parts.append(f"{p}:{st.st_mtime_ns}:{st.st_size}")
+        return hashlib.sha1("|".join(parts).encode("utf-8")).hexdigest()
+    except Exception:
+        return None
+
 def _outro_segment_with_copyright(src, target):
+    # The outro template + copyright overlay are the same shared settings-level
+    # assets for every project/render, so the rendered result is identical every
+    # time until one of those two files actually changes. Cache it once (keyed by
+    # mtime+size of both inputs) instead of re-running a full libx264/videotoolbox
+    # encode of the outro on every single export.
     overlay = CONFIG / "outro_copyright.png"
+    cache_dir = CONFIG / "cache"
+    cache_key = _outro_cache_key(src, overlay) if overlay.exists() else None
+    cached = cache_dir / f"outro_{cache_key}.mp4" if cache_key else None
+    if cached and cached.exists():
+        try:
+            shutil.copyfile(str(cached), str(target))
+            return target
+        except Exception:
+            pass
+    out = None
     if overlay.exists() and ffmpeg_has_filter("overlay"):
         out = _overlay_png_on_video(src, overlay, target)
-        if out:
-            return out
-    return _normalized_segment(src, 0, None, target)
+    if not out:
+        out = _normalized_segment(src, 0, None, target)
+    if out and cached:
+        try:
+            cache_dir.mkdir(parents=True, exist_ok=True)
+            shutil.copyfile(str(out), str(cached))
+        except Exception:
+            pass
+    return out
 
 
 def _intro_text_alpha_expr(index, count, duration):
@@ -1859,7 +1993,7 @@ def _title_screen_segment(cfg, target, duration=None):
             cmd += ["-map", "0:a:0"]
         else:
             cmd += ["-f", "lavfi", "-i", f"anullsrc=channel_layout=stereo:sample_rate=48000:d={duration}", "-map", "1:a:0"]
-        cmd += ["-r", "30", "-c:v", "libx264", "-preset", "veryfast", "-crf", "22", "-c:a", "aac", "-b:a", "160k", "-shortest", str(target)]
+        cmd += ["-r", "30", *video_encode_args("22"), "-c:a", "aac", "-b:a", "160k", "-shortest", str(target)]
         code, so, se = run(cmd)
         if code == 0 and target.exists():
             return target
@@ -1875,7 +2009,7 @@ def _title_screen_segment(cfg, target, duration=None):
             cmd += ["-map", "0:a:0"]
         else:
             cmd += ["-f", "lavfi", "-i", f"anullsrc=channel_layout=stereo:sample_rate=48000:d={duration}", "-map", "2:a:0"]
-        cmd += ["-r", "30", "-c:v", "libx264", "-preset", "veryfast", "-crf", "22", "-c:a", "aac", "-b:a", "160k", "-shortest", str(target)]
+        cmd += ["-r", "30", *video_encode_args("22"), "-c:a", "aac", "-b:a", "160k", "-shortest", str(target)]
         code, so, se = run(cmd)
         if code == 0 and target.exists():
             return target
@@ -1888,14 +2022,14 @@ def _title_screen_segment(cfg, target, duration=None):
             cmd += ["-map", "0:a:0"]
         else:
             cmd += ["-f", "lavfi", "-i", f"anullsrc=channel_layout=stereo:sample_rate=48000:d={duration}", "-map", "1:a:0"]
-        cmd += ["-r", "30", "-c:v", "libx264", "-preset", "veryfast", "-crf", "22", "-c:a", "aac", "-b:a", "160k", "-shortest", str(target)]
+        cmd += ["-r", "30", *video_encode_args("22"), "-c:a", "aac", "-b:a", "160k", "-shortest", str(target)]
         code, so, se = run(cmd)
         if code == 0 and target.exists():
             return target
 
     if intro_exists:
         cmd = ["ffmpeg", "-y", "-hide_banner", "-i", str(intro), "-t", str(duration),
-               "-vf", ",".join(base_filters), "-r", "30", "-c:v", "libx264", "-preset", "veryfast", "-crf", "22", "-c:a", "aac", "-b:a", "160k", "-shortest", str(target)]
+               "-vf", ",".join(base_filters), "-r", "30", *video_encode_args("22"), "-c:a", "aac", "-b:a", "160k", "-shortest", str(target)]
         code, so, se = run(cmd)
         if code == 0 and target.exists():
             return target
@@ -1903,7 +2037,7 @@ def _title_screen_segment(cfg, target, duration=None):
     cmd = ["ffmpeg", "-y", "-hide_banner", "-f", "lavfi", "-i", f"color=c=0f172a:s=1920x1080:d={duration}",
            "-f", "lavfi", "-i", f"anullsrc=channel_layout=stereo:sample_rate=48000:d={duration}",
            "-vf", ",".join(base_filters), "-map", "0:v:0", "-map", "1:a:0",
-           "-r", "30", "-c:v", "libx264", "-preset", "veryfast", "-crf", "22", "-c:a", "aac", "-b:a", "160k", "-shortest", str(target)]
+           "-r", "30", *video_encode_args("22"), "-c:a", "aac", "-b:a", "160k", "-shortest", str(target)]
     code, so, se = run(cmd)
     if code != 0 or not target.exists():
         raise RuntimeError((se or so or "Vytvoření vstupní obrazovky selhalo")[-1500:])
@@ -2422,14 +2556,14 @@ def _render_full_hd_segment(src, start, duration, target):
     if _media_has_audio(src):
         cmd = base + [
             "-map", "0:v:0", "-map", "0:a:0?", "-vf", vf,
-            "-r", "30", "-c:v", "libx264", "-preset", "veryfast", "-crf", "20",
+            "-r", "30", *video_encode_args("20"),
             "-c:a", "aac", "-b:a", "192k", "-ar", "48000", "-ac", "2", "-shortest", "-movflags", "+faststart", str(target)
         ]
     else:
         cmd = base + [
             "-f", "lavfi", "-i", f"anullsrc=channel_layout=stereo:sample_rate=48000:d={_ffmpeg_time(seg_dur)}",
             "-map", "0:v:0", "-map", "1:a:0", "-vf", vf,
-            "-r", "30", "-c:v", "libx264", "-preset", "veryfast", "-crf", "20",
+            "-r", "30", *video_encode_args("20"),
             "-c:a", "aac", "-b:a", "192k", "-ar", "48000", "-ac", "2", "-shortest", "-movflags", "+faststart", str(target)
         ]
     code, so, se = run(cmd)
@@ -2492,6 +2626,349 @@ def _write_arbochat_summary(cfg, outdir):
     out.write_text("\n".join(lines).strip() + "\n", encoding="utf-8")
     return out
 
+
+# --- Sample for social networks: a short vertical (9:16) highlight reel for
+# Facebook/LinkedIn made of a generated title card plus a handful of cutaways
+# from the speaker and gallery tracks, joined with subtle crossfades. ---
+
+def _vertical_normalized_segment(src, start, duration, target, crf="21"):
+    """Same idea as _normalized_segment, but center-cropped to 9:16 for social clips."""
+    target.parent.mkdir(parents=True, exist_ok=True)
+    seg_dur = _segment_duration(src, start, duration)
+    if seg_dur <= 0.25:
+        return None
+    dur_args = ["-t", _ffmpeg_time(seg_dur)]
+    base = ["ffmpeg", "-y", "-hide_banner", "-ss", _ffmpeg_time(start), "-i", str(src), *dur_args]
+    vf = "crop=ih*9/16:ih:(iw-ih*9/16)/2:0,scale=1080:1920,setsar=1,format=yuv420p"
+    if _media_has_audio(src):
+        cmd = base + [
+            "-map", "0:v:0", "-map", "0:a:0?",
+            "-vf", vf, "-r", "30", *video_encode_args(crf),
+            "-c:a", "aac", "-b:a", "192k", "-ar", "48000", "-ac", "2", "-shortest", str(target)
+        ]
+    else:
+        cmd = base + [
+            "-f", "lavfi", "-i", f"anullsrc=channel_layout=stereo:sample_rate=48000:d={_ffmpeg_time(seg_dur)}",
+            "-map", "0:v:0", "-map", "1:a:0",
+            "-vf", vf, "-r", "30", *video_encode_args(crf),
+            "-c:a", "aac", "-b:a", "192k", "-ar", "48000", "-ac", "2", "-shortest", str(target)
+        ]
+    code, so, se = run(cmd)
+    if code != 0 or not target.exists():
+        raise RuntimeError((se or so or f"Nelze vytvořit vertikální záběr {target.name}")[-1500:])
+    return target
+
+
+def _social_title_overlay_png(cfg, target, width=1080, height=1920):
+    """Transparent PNG with the title card text, rendered via Pillow.
+
+    ffmpeg's drawtext/subtitles filters need libfreetype/libass, which aren't
+    part of every ffmpeg build (this app already hits that with the horizontal
+    intro card and falls back to a Pillow-rendered PNG composited with the
+    always-available `overlay` filter — same approach here, just vertical).
+    """
+    target = Path(target)
+    target.parent.mkdir(parents=True, exist_ok=True)
+    try:
+        from PIL import Image, ImageDraw, ImageFont
+    except Exception:
+        return None
+
+    meta = cfg.get("meta", {}) or {}
+    topic = str(meta.get("topic") or cfg.get("name") or "ArboChat").strip()
+    speaker = str(meta.get("speaker") or "").strip()
+    episode = str(meta.get("episode_number") or "").strip()
+
+    img = Image.new("RGBA", (width, height), (0, 0, 0, 0))
+    draw = ImageDraw.Draw(img)
+
+    def font_for(size):
+        fontfile = _fontfile_for_intro("Inter")
+        try:
+            if fontfile and Path(fontfile).exists():
+                return ImageFont.truetype(fontfile, size=size)
+        except Exception:
+            pass
+        for cand in ["/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf",
+                     "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf"]:
+            try:
+                if Path(cand).exists():
+                    return ImageFont.truetype(cand, size=size)
+            except Exception:
+                pass
+        return ImageFont.load_default()
+
+    def fit_lines(text, start_size, min_size, max_width):
+        # Shrink to fit on one line; if still too wide even at min_size, wrap
+        # into two lines split near the middle word boundary.
+        size = start_size
+        while size > min_size:
+            font = font_for(size)
+            w = draw.textbbox((0, 0), text, font=font)[2]
+            if w <= max_width:
+                return [(text, font)]
+            size -= 2
+        font = font_for(min_size)
+        if draw.textbbox((0, 0), text, font=font)[2] <= max_width or " " not in text:
+            return [(text, font)]
+        words = text.split(" ")
+        best_split, best_diff = 1, None
+        for i in range(1, len(words)):
+            a, b = " ".join(words[:i]), " ".join(words[i:])
+            diff = abs(len(a) - len(b))
+            if best_diff is None or diff < best_diff:
+                best_split, best_diff = i, diff
+        return [(" ".join(words[:best_split]), font), (" ".join(words[best_split:]), font)]
+
+    def draw_centered(text, y, font, fill):
+        bbox = draw.textbbox((0, 0), text, font=font)
+        w, h = bbox[2] - bbox[0], bbox[3] - bbox[1]
+        draw.text(((width - w) / 2, y), text, font=font, fill=fill,
+                   stroke_width=max(2, int(font.size * 0.06)), stroke_fill=(2, 6, 23, 225))
+        return h
+
+    max_w = int(width * 0.86)
+    topic_lines = fit_lines(topic or (cfg.get("name") or "ArboChat"), 64, 38, max_w)
+    line_gap = 14
+    block_h = (0 if not episode else 46 + 24)
+    block_h += sum(f.size + 10 for _, f in topic_lines) + line_gap * max(0, len(topic_lines) - 1)
+    block_h += (0 if not speaker else 40 + 24)
+
+    band_pad = 46
+    band_top = int(height * 0.5 - (block_h + band_pad * 2) / 2)
+    band_bottom = band_top + block_h + band_pad * 2
+    draw.rectangle([0, band_top, width, band_bottom], fill=(6, 12, 26, 150))
+
+    y = band_top + band_pad
+    if episode:
+        y += draw_centered(f"ARBOCHAT #{episode}", y, font_for(46), (74, 222, 128, 255))
+        y += 24
+    for text, font in topic_lines:
+        y += draw_centered(text, y, font, (248, 250, 252, 255))
+        y += line_gap
+    if speaker:
+        y += 10
+        draw_centered(speaker, y, font_for(40), (203, 213, 225, 255))
+
+    img.save(target)
+    return target if target.exists() else None
+
+
+def _social_title_card(cfg, target, duration=4.0, background_src=None, background_time=None):
+    """Vertical title card: ArboChat episode number, topic/title and speaker name.
+
+    Background is a blurred, slowly zoomed still frame taken from the speaker
+    video when available (feels tied to the actual recording instead of a flat
+    color), otherwise falls back to a plain brand-colored background. Text is
+    composited from a Pillow-rendered PNG (see _social_title_overlay_png).
+    """
+    target = Path(target)
+    target.parent.mkdir(parents=True, exist_ok=True)
+    work = target.parent
+
+    frame_path = None
+    if background_src and Path(background_src).exists():
+        candidate = work / "social_title_bg.jpg"
+        bt = 0.0 if background_time is None else max(0.0, float(background_time))
+        cmd = ["ffmpeg", "-y", "-hide_banner", "-ss", _ffmpeg_time(bt), "-i", str(background_src),
+               "-frames:v", "1", "-vf", "crop=ih*9/16:ih:(iw-ih*9/16)/2:0,scale=1080:1920",
+               "-q:v", "3", str(candidate)]
+        code, so, se = run(cmd)
+        if code == 0 and candidate.exists():
+            frame_path = candidate
+
+    frames_n = max(1, int(round(float(duration) * 30)))
+    if frame_path:
+        inputs = ["-loop", "1", "-i", str(frame_path), "-t", str(duration)]
+        # Blurred + darkened + desaturated backdrop with a slow, subtle zoom
+        # (professional "Ken Burns" feel rather than a static or flashy card).
+        bg_vf = (
+            "scale=1080:1920,gblur=sigma=22,eq=brightness=-0.18:saturation=0.75,"
+            f"zoompan=z='min(zoom+0.0006,1.05)':d={frames_n}:s=1080x1920:fps=30,format=yuv420p"
+        )
+    else:
+        inputs = ["-f", "lavfi", "-i", f"color=c=0f172a:s=1080x1920:d={duration}"]
+        bg_vf = "format=yuv420p"
+
+    overlay_png = _social_title_overlay_png(cfg, work / "social_title_overlay.png")
+    if overlay_png and ffmpeg_has_filter("overlay"):
+        filter_complex = (
+            f"[0:v]{bg_vf}[bg];[1:v]scale=1080:1920,format=rgba[ov];"
+            "[bg][ov]overlay=0:0:format=auto,format=yuv420p[v]"
+        )
+        cmd = ["ffmpeg", "-y", "-hide_banner", *inputs, "-loop", "1", "-i", str(overlay_png), "-t", str(duration),
+               "-f", "lavfi", "-i", f"anullsrc=channel_layout=stereo:sample_rate=48000:d={duration}",
+               "-filter_complex", filter_complex,
+               "-map", "[v]", "-map", "2:a:0",
+               "-r", "30", *video_encode_args("21"), "-c:a", "aac", "-b:a", "160k", "-ar", "48000", "-ac", "2",
+               "-shortest", "-movflags", "+faststart", str(target)]
+    else:
+        # No text renderer available at all: still produce a usable (textless) card
+        # instead of failing the whole highlight reel.
+        cmd = ["ffmpeg", "-y", "-hide_banner", *inputs,
+               "-f", "lavfi", "-i", f"anullsrc=channel_layout=stereo:sample_rate=48000:d={duration}",
+               "-vf", bg_vf, "-map", "0:v:0", "-map", "1:a:0",
+               "-r", "30", *video_encode_args("21"), "-c:a", "aac", "-b:a", "160k", "-ar", "48000", "-ac", "2",
+               "-shortest", "-movflags", "+faststart", str(target)]
+    code, so, se = run(cmd)
+    if code != 0 or not target.exists():
+        raise RuntimeError((se or so or "Vytvoření titulní karty selhalo")[-1500:])
+    return target
+
+
+def _xfade_concat(clip_paths, final, work, transition_duration=0.5, transitions=None):
+    """Join already-normalized same-format clips with crossfades (xfade/acrossfade)
+    instead of a hard cut. `transitions` is a list of one transition name per join
+    (length len(clip_paths)-1); defaults to a plain crossfade throughout.
+    """
+    clip_paths = [Path(c) for c in clip_paths if c]
+    if not clip_paths:
+        raise RuntimeError("Nevznikl žádný záběr pro spojení")
+    final = Path(final)
+    final.parent.mkdir(parents=True, exist_ok=True)
+    if len(clip_paths) == 1:
+        shutil.copyfile(str(clip_paths[0]), str(final))
+        return final
+
+    durations = [float(ffprobe(c).get("duration") or 0) for c in clip_paths]
+    transitions = list(transitions or [])
+    while len(transitions) < len(clip_paths) - 1:
+        transitions.append("fade")
+
+    t = float(transition_duration)
+    t = max(0.15, min(t, min(durations) * 0.35))
+
+    inputs = []
+    for c in clip_paths:
+        inputs += ["-i", str(c)]
+
+    filter_parts = []
+    prev_v, prev_a = "0:v", "0:a"
+    cum = durations[0]
+    for i in range(1, len(clip_paths)):
+        trans = transitions[i - 1]
+        offset = max(0.0, cum - t)
+        vout, aout = f"v{i}", f"a{i}"
+        filter_parts.append(f"[{prev_v}][{i}:v]xfade=transition={trans}:duration={t:.3f}:offset={offset:.3f}[{vout}]")
+        filter_parts.append(f"[{prev_a}][{i}:a]acrossfade=d={t:.3f}[{aout}]")
+        prev_v, prev_a = vout, aout
+        cum = cum + durations[i] - t
+
+    cmd = ["ffmpeg", "-y", "-hide_banner", *inputs,
+           "-filter_complex", ";".join(filter_parts),
+           "-map", f"[{prev_v}]", "-map", f"[{prev_a}]",
+           "-r", "30", *video_encode_args("20"), "-c:a", "aac", "-b:a", "192k", "-ar", "48000", "-ac", "2",
+           "-movflags", "+faststart", str(final)]
+    code, so, se = run(cmd)
+    if code != 0 or not final.exists():
+        raise RuntimeError((se or so or "Spojení vzorku pro sociální sítě selhalo")[-1500:])
+    return final
+
+
+def _generate_social_clip(pid):
+    """Build a ~1 minute vertical (9:16) highlight reel for Facebook/LinkedIn:
+    a generated title card, a speaker close-up, a few presentation cutaways from
+    later in the talk, and (if available) several gallery/discussion cutaways,
+    joined with subtle, professional crossfades rather than hard cuts.
+    """
+    cfg = project_config(pid)
+    cfg = _recover_project_files_from_folder(cfg)
+    files = cfg.get("files", {})
+    cuts = cfg.get("cuts", {})
+    speaker = files.get("speaker_video")
+    gallery = files.get("gallery_video")
+    if not speaker or not Path(speaker).exists():
+        raise RuntimeError("Chybí hlavní video pro vzorek pro sociální sítě")
+
+    speaker_dur = float(ffprobe(speaker).get("duration") or 0)
+    gallery_dur = float(ffprobe(gallery).get("duration") or 0) if gallery and Path(gallery).exists() else 0
+
+    real = max(0.0, _seconds(cuts.get("real_start"), 0))
+    discussion = _seconds(cuts.get("discussion_start") if cuts.get("discussion_start") is not None else cuts.get("gallery_start"), -1)
+    main_end = discussion if (discussion >= 0 and discussion > real) else speaker_dur
+    if speaker_dur > 0:
+        main_end = min(main_end, speaker_dur)
+    main_span = max(0.0, main_end - real)
+
+    work = project_dir(pid) / "work" / "social_clip"
+    work.mkdir(parents=True, exist_ok=True)
+    for old in work.glob("*"):
+        try: old.unlink()
+        except Exception: pass
+
+    clips = []
+    transitions = []
+
+    def add(path_or_none, transition="fade"):
+        if path_or_none:
+            if clips:
+                transitions.append(transition)
+            clips.append(path_or_none)
+
+    # 1) Generated title card: episode number, topic and speaker.
+    bg_time = real + min(4.0, main_span * 0.15) if main_span > 0 else 0.0
+    add(_social_title_card(cfg, work / "000_title.mp4", duration=4.0, background_src=speaker, background_time=bg_time))
+
+    # 2) Speaker close-up near the start of the talk.
+    hero_start = real + (1.5 if main_span > 3 else 0)
+    hero_dur = min(9.0, max(3.0, main_span * 0.25)) if main_span > 0 else 3.0
+    add(_vertical_normalized_segment(speaker, hero_start, hero_dur, work / "001_speaker.mp4"), "fade")
+
+    # 3) A few presentation cutaways spread across the rest of the talk.
+    remaining_start = hero_start + hero_dur + 1.0
+    remaining_span = max(0.0, main_end - remaining_start)
+    presentation_count = 3 if remaining_span > 15 else (2 if remaining_span > 8 else (1 if remaining_span > 3 else 0))
+    presentation_trans = ["dissolve", "smoothleft", "fade"]
+    if presentation_count:
+        slot = remaining_span / presentation_count
+        clip_dur = min(7.0, max(2.5, slot * 0.55))
+        for i in range(presentation_count):
+            t0 = remaining_start + slot * i + slot * 0.2
+            add(_vertical_normalized_segment(speaker, t0, clip_dur, work / f"{len(clips):03d}_presentation.mp4"),
+                presentation_trans[i % len(presentation_trans)])
+
+    # 4) Gallery/discussion cutaways sampled across the gallery clip's own timeline.
+    has_gallery = bool(gallery and Path(gallery).exists() and gallery_dur > 1.0)
+    if has_gallery:
+        gallery_count = 4 if gallery_dur > 40 else (3 if gallery_dur > 20 else (2 if gallery_dur > 8 else 1))
+        gallery_trans = ["smoothright", "dissolve", "fade", "smoothleft"]
+        margin = min(3.0, gallery_dur * 0.08)
+        usable = max(0.0, gallery_dur - margin * 2)
+        slot = usable / gallery_count if gallery_count else 0
+        clip_dur = min(6.0, max(2.5, slot * 0.6)) if slot else 0
+        for i in range(gallery_count):
+            t0 = margin + slot * i + slot * 0.15
+            add(_vertical_normalized_segment(gallery, t0, clip_dur, work / f"{len(clips):03d}_gallery.mp4"),
+                gallery_trans[i % len(gallery_trans)])
+    elif remaining_span > 3 and presentation_count < 3:
+        # No gallery footage: one more presentation cutaway so the reel still runs close to a minute.
+        t0 = remaining_start + remaining_span * 0.7
+        add(_vertical_normalized_segment(speaker, t0, min(7.0, max(2.5, remaining_span * 0.25)),
+            work / f"{len(clips):03d}_presentation.mp4"), "dissolve")
+
+    # 5) Optional closing brand card from the shared outro template.
+    settings = load_settings()
+    outro = settings.get("outro_template")
+    if outro and Path(outro).exists():
+        outro_dur = min(3.5, float(ffprobe(outro).get("duration") or 3.5))
+        add(_vertical_normalized_segment(outro, 0, outro_dur, work / f"{len(clips):03d}_outro.mp4"), "fade")
+
+    if len(clips) < 2:
+        raise RuntimeError("Nepodařilo se sestavit dostatek záběrů pro vzorek pro sociální sítě")
+
+    final = project_dir(pid) / "output" / f"{safe_name(cfg.get('name','ArboChat'))}_socialni_sit_vertical.mp4"
+    _xfade_concat(clips, final, work, transition_duration=0.5, transitions=transitions)
+
+    cfg.setdefault("files", {})["social_clip_video"] = str(final)
+    cfg.setdefault("analysis", {})["social_clip"] = {
+        "created_at": datetime.datetime.now().isoformat(timespec="seconds"),
+        "duration": float(ffprobe(final).get("duration") or 0),
+        "clips": len(clips),
+        "has_gallery": has_gallery,
+    }
+    save_project(cfg)
+    return cfg
+
 def _render_project(pid):
     cfg = project_config(pid)
     files = cfg.get("files", {})
@@ -2516,7 +2993,19 @@ def _render_project(pid):
         # Finální výstup je vždy jedno MP4: obraz + aktivní zvuková stopa dohromady.
         # Nevracíme samostatný WAV; ten zůstává jen pracovní export v sekci 4.
         segments = []
-        master_seg = _render_full_hd_segment(master, start, end - start if end else None, work / "000_master_full_hd.mp4")
+        # The master is built by _compose_edit_master/_delete_marked_silences from
+        # segments that are already normalized to this exact Full HD/h264/aac spec
+        # and stream-copy concatenated, so when no extra trim is requested here it
+        # is byte-for-byte already the target format. Re-encoding it again in that
+        # case was pure wasted work (a full second libx264 pass over the whole
+        # video every render). Skip straight to using it as the segment; the copy
+        # path in _concat_full_hd_segments below then makes this a plain file copy
+        # instead of a re-encode. Any real trim (start/end inside the master) still
+        # goes through the frame-accurate re-encode path unchanged.
+        if start <= 0.01 and end >= total - 0.01 and _is_full_hd_h264_aac(info):
+            master_seg = Path(master)
+        else:
+            master_seg = _render_full_hd_segment(master, start, end - start if end else None, work / "000_master_full_hd.mp4")
         if master_seg:
             segments.append(master_seg)
 
@@ -2564,7 +3053,7 @@ def _render_project(pid):
         target = work / f"{len(segments):03d}_{name}.mp4"
         dur_args = [] if end is None else ["-t", _ffmpeg_time(max(0.25, end - start))]
         cmd = ["ffmpeg", "-y", "-hide_banner", "-ss", _ffmpeg_time(start), "-i", str(src), *dur_args,
-               "-vf", "scale=1920:1080:force_original_aspect_ratio=decrease,pad=1920:1080:(ow-iw)/2:(oh-ih)/2,setsar=1,format=yuv420p", "-r", "30", "-c:v", "libx264", "-preset", "veryfast", "-crf", "20", "-c:a", "aac", "-b:a", "160k", "-ar", "48000", "-ac", "2", str(target)]
+               "-vf", "scale=1920:1080:force_original_aspect_ratio=decrease,pad=1920:1080:(ow-iw)/2:(oh-ih)/2,setsar=1,format=yuv420p", "-r", "30", *video_encode_args("20"), "-c:a", "aac", "-b:a", "160k", "-ar", "48000", "-ac", "2", str(target)]
         code, so, se = run(cmd)
         if code != 0 or not target.exists():
             raise RuntimeError((se or so or f"Nelze vytvořit segment {name}")[-1200:])
@@ -2857,6 +3346,10 @@ class Handler(BaseHTTPRequestHandler):
             if path == "/api/render":
                 pid = data.get("project") or data.get("id")
                 return self.send_json(_render_project(pid))
+
+            if path == "/api/generate_social_clip":
+                pid = data.get("project") or data.get("id")
+                return self.send_json({"ok": True, "project": _generate_social_clip(pid)})
 
             return self.send_json(_json_error("Neznámý endpoint", 404), 404)
         except Exception as e:

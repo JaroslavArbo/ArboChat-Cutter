@@ -12,6 +12,58 @@ const TRACK_COLORS = {
   edit_master_video: '#3b82f6',
 };
 
+// Shared keyboard shortcuts for the trim editors: I/O mark in/out points at the
+// playhead, arrow keys nudge the playhead, Space toggles the active preview
+// video. Ignored while the user is typing into an input/textarea so it never
+// hijacks normal text entry.
+function useTrimShortcuts({ onMarkStart, onMarkEnd, onNudge, previewVideoId }) {
+  useEffect(() => {
+    const handler = (event) => {
+      const tag = (event.target?.tagName || '').toLowerCase();
+      if (tag === 'input' || tag === 'textarea' || tag === 'select' || event.target?.isContentEditable) return;
+      if (event.metaKey || event.ctrlKey || event.altKey) return;
+      const step = event.shiftKey ? 5 : 1;
+      if (event.key === 'i' || event.key === 'I') {
+        if (onMarkStart) { event.preventDefault(); onMarkStart(); }
+      } else if (event.key === 'o' || event.key === 'O') {
+        if (onMarkEnd) { event.preventDefault(); onMarkEnd(); }
+      } else if (event.key === 'ArrowLeft') {
+        if (onNudge) { event.preventDefault(); onNudge(-step); }
+      } else if (event.key === 'ArrowRight') {
+        if (onNudge) { event.preventDefault(); onNudge(step); }
+      } else if (event.key === ' ') {
+        const video = previewVideoId && document.getElementById(previewVideoId);
+        if (video && !video.hidden) {
+          event.preventDefault();
+          if (video.paused) video.play().catch(() => {}); else video.pause();
+        }
+      }
+    };
+    window.addEventListener('keydown', handler);
+    return () => window.removeEventListener('keydown', handler);
+  }, [onMarkStart, onMarkEnd, onNudge, previewVideoId]);
+}
+
+function TimeField({ value, onCommit, title }) {
+  const [text, setText] = useState(fmt(value));
+  useEffect(() => { setText(fmt(value)); }, [value]);
+  const commit = () => {
+    const parsed = parseTime(text, value);
+    setText(fmt(parsed));
+    if (Math.abs(parsed - value) > 0.001) onCommit(parsed);
+  };
+  return <input
+    className="timeField"
+    type="text"
+    inputMode="numeric"
+    title={title}
+    value={text}
+    onChange={(e) => setText(e.target.value)}
+    onBlur={commit}
+    onKeyDown={(e) => { if (e.key === 'Enter') { e.currentTarget.blur(); } if (e.key === 'Escape') { setText(fmt(value)); e.currentTarget.blur(); } }}
+  />;
+}
+
 function useLog() {
   const [lines, setLines] = useState([]);
   const log = useCallback((msg) => {
@@ -938,6 +990,13 @@ function TimelineEditor({project, setProject, log}) {
     setCut(key, time);
   };
 
+  useTrimShortcuts({
+    onMarkStart: () => applyPlayhead('real_start'),
+    onMarkEnd: () => applyPlayhead('discussion_start'),
+    onNudge: (delta) => setTime(t => Math.max(0, Math.min(duration, t + delta))),
+    previewVideoId: 'previewVideo',
+  });
+
   const showVideoAtPlayhead = async () => {
     const video = document.getElementById('previewVideo');
     if(!video){ alert('Video přehrávač nebyl nalezen.'); return; }
@@ -970,9 +1029,12 @@ function TimelineEditor({project, setProject, log}) {
   return <section className="card timelineCard">
     <div className="cardHead"><h2>3 · Střihačská osa</h2><span className="muted">Nejdřív nastav začátek po trimu, doprovodné video a přechod do galerie.</span></div>
     <div className="timelineToolbar">
-      <button onClick={() => applyPlayhead('real_start')}>Playhead → vyznačit začátek po trimu</button>
-      <button onClick={() => applyPlayhead('discussion_start')}>Playhead → začátek přechodu do galerie</button>
+      <button onClick={() => applyPlayhead('real_start')}>Playhead → vyznačit začátek po trimu (I)</button>
+      <label className="cutTimeField">Začátek <TimeField value={Number(project.cuts?.real_start || 0)} onCommit={(v) => setCut('real_start', v)} title="Přesný čas začátku po trimu (HH:MM:SS)" /></label>
+      <button onClick={() => applyPlayhead('discussion_start')}>Playhead → začátek přechodu do galerie (O)</button>
+      <label className="cutTimeField">Galerie <TimeField value={Number(project.cuts?.discussion_start || 0)} onCommit={(v) => setCut('discussion_start', v)} title="Přesný čas přechodu do galerie (HH:MM:SS)" /></label>
     </div>
+    <p className="muted shortcutHint">Klávesy: I = začátek po trimu, O = přechod do galerie, ←/→ = posun o 1 s (Shift = 5 s), mezerník = přehrát/pauza náhledu.</p>
     <div className="timelineLegend">
       <span><i className="dot replacement"></i>Doprovodné video</span>
       <span><i className="dot gallery"></i>Galerie</span>
@@ -1179,6 +1241,18 @@ function SingleVideoEditor({project, setProject, exportAudio, importAudio, optim
     setManualStart(null);
   };
 
+  const setTrimBound = (key, value) => {
+    const nextCuts = {...(project.cuts || {}), [key]: Number(value || 0)};
+    setProject({...project, cuts: nextCuts});
+  };
+
+  useTrimShortcuts({
+    onMarkStart: markManualStart,
+    onMarkEnd: markManualEnd,
+    onNudge: (delta) => setSingleTime(t => Math.max(0, Math.min(duration || 0, t + delta))),
+    previewVideoId: 'editPreviewVideo',
+  });
+
   return <div className="singleEditor">
     <h3>Nová střihačská osa · jediné pracovní video</h3>
     <p className="muted">Tažením levého nebo pravého okraje klipu doladíš trim celého spojeného videa. Tyto hodnoty se použijí v sekci 6 při vytvoření finálního videa.</p>
@@ -1188,15 +1262,19 @@ function SingleVideoEditor({project, setProject, exportAudio, importAudio, optim
       <div className="previewStatus">{singlePreviewStatus}</div>
       <video id="editPreviewVideo" className="previewVideo" controls hidden />
     </div>
+    <p className="muted shortcutHint">Klávesy: I = začátek úseku, O = konec úseku, ←/→ = posun o 1 s (Shift = 5 s), mezerník = přehrát/pauza náhledu.</p>
     <div className="manualCutPanel">
       <strong>Ruční úseky k odstranění</strong>
-      <button onClick={markManualStart}>Začátek úseku zde</button>
-      <button onClick={markManualEnd}>Konec úseku zde</button>
+      <button onClick={markManualStart}>Začátek úseku zde (I)</button>
+      <button onClick={markManualEnd}>Konec úseku zde (O)</button>
       <button onClick={clearManualCuts} disabled={!manualCuts.length}>Vymazat ruční značky</button>
       <span className="muted">{manualStart !== null ? `Začátek označen: ${fmt(manualStart)}. Posuň hlavu na konec a stiskni Konec úseku zde.` : `${manualCuts.length} ručních úseků bude smazáno spolu s tichy.`}</span>
     </div>
     <div className="singleTrimInfo">
-      Trim pracovní stopy: <strong>{fmt(trimStart)}</strong> → <strong>{fmt(trimEnd)}</strong>
+      Trim pracovní stopy:
+      <TimeField value={trimStart} onCommit={(v) => setTrimBound('edit_master_start', Math.max(0, Math.min(v, trimEnd - 1)))} title="Přesný začátek trimu (HH:MM:SS)" />
+      →
+      <TimeField value={trimEnd} onCommit={(v) => setTrimBound('edit_master_end', Math.max(trimStart + 1, Math.min(v, duration || v)))} title="Přesný konec trimu (HH:MM:SS)" />
     </div>
     <div className="actions audioActions">
       <button className="primary" onClick={optimizeVideo} disabled={busy}>{busyAction === 'optimize' ? 'Optimalizuji…' : 'Optimalizuj video'}</button>
@@ -1221,6 +1299,30 @@ function FinalRenderSection({project, renderProject, busy, busyAction}) {
     <div className="actions">
       <button className="render" onClick={renderProject} disabled={busy || !hasMaster}>{busyAction === 'render' ? 'Rendruji…' : 'Rendruj finální video'}</button>
     </div>
+  </section>;
+}
+
+function SocialClipSection({project, generateSocialClip, busy, busyAction}) {
+  const canGenerate = Boolean(project?.files?.speaker_video);
+  const hasGallery = Boolean(project?.files?.gallery_video);
+  const info = project?.analysis?.social_clip;
+  const clipFile = project?.files?.social_clip_video;
+  const clipUrl = clipFile ? `/api/source_video?project=${encodeURIComponent(project.id)}&role=social_clip_video&_=${encodeURIComponent(info?.created_at || clipFile)}` : null;
+  return <section className="card socialClipStep">
+    <div className="cardHead">
+      <h2>7 · Vzorek pro sociální sítě</h2>
+      <span className="muted">Svislý (9:16) sestřih cca na minutu pro Facebook/LinkedIn: titulní obrazovka s dílem, jménem řečníka a číslem ArboChatu, záběr na řečníka, ukázky prezentace a záběry galerie s odbornými přechody.</span>
+    </div>
+    {canGenerate
+      ? <p className="muted">Použije hlavní video{hasGallery ? ' a galerii' : ''} podle aktuálních střihových bodů (začátek po trimu{hasGallery ? ', přechod do galerie' : ''}).</p>
+      : <p className="muted">Nejdřív v sekci 1 načti hlavní video.</p>}
+    <div className="actions">
+      <button className="render" onClick={generateSocialClip} disabled={busy || !canGenerate}>{busyAction === 'socialClip' ? 'Generuji vzorek…' : 'Vygenerovat vzorek pro sociální sítě'}</button>
+    </div>
+    {clipUrl && <div className="socialClipPreview">
+      <video className="socialClipVideo" src={clipUrl} controls />
+      {info && <p className="muted">Délka {fmt(info.duration)} · {info.clips} záběrů{info.has_gallery ? ' (včetně galerie)' : ''}</p>}
+    </div>}
   </section>;
 }
 
@@ -1429,6 +1531,18 @@ function App() {
     finally { setBusy(false); setBusyAction(''); setBusyLabel(''); }
   };
 
+  const generateSocialClip = async () => {
+    setBusy(true); setBusyAction('socialClip'); setBusyLabel('Generuji vzorek pro sociální sítě…');
+    await waitForPaint();
+    try {
+      await saveProject();
+      const data = await api('/api/generate_social_clip', {method:'POST', body:JSON.stringify({project:project.id})});
+      setProject(data.project);
+      log('Vzorek pro sociální sítě hotový.');
+    } catch(e) { alert(e.message); log('Vzorek pro sociální sítě selhal: '+e.message); }
+    finally { setBusy(false); setBusyAction(''); setBusyLabel(''); }
+  };
+
   return <div className="app">
     <ProjectSidebar projects={projects} currentId={project?.id} onCreate={createProject} onSelect={loadProject} onRefresh={loadProjects} />
     <main>
@@ -1447,6 +1561,7 @@ function App() {
         <EditVideoStep project={project} saveProject={saveProject} prepareEditVideo={prepareEditVideo} fullAuto={fullAuto} exportAudio={exportAudio} importAudio={importAudio} optimizeVideo={optimizeVideo} deleteSilences={deleteSilences} adjustAudio={adjustAudio} setProject={setProject} busy={busy} busyAction={busyAction} />
         <SilenceAnalysisSection project={project} />
         <FinalRenderSection project={project} renderProject={renderProject} busy={busy} busyAction={busyAction} />
+        <SocialClipSection project={project} generateSocialClip={generateSocialClip} busy={busy} busyAction={busyAction} />
         <LogPanel lines={lines} />
       </>}
     </main>
