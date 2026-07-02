@@ -1302,10 +1302,73 @@ function FinalRenderSection({project, renderProject, busy, busyAction}) {
   </section>;
 }
 
-function SocialClipSection({project, generateSocialClip, busy, busyAction}) {
+function SocialClipTimeline({project, setProject}) {
+  const social = project?.analysis?.social_clip || {};
+  const plan = social.plan || [];
+  const speakerItems = plan.filter(p => p.role === 'speaker_video');
+  const galleryItems = plan.filter(p => p.role === 'gallery_video');
+  const speakerDur = Number(social.speaker_duration || 0) || (speakerItems.length ? Math.max(60, ...speakerItems.map(p => p.start + p.duration)) : 60);
+  const galleryDur = Number(social.gallery_duration || 0) || (galleryItems.length ? Math.max(60, ...galleryItems.map(p => p.start + p.duration)) : 0);
+
+  const [speakerTime, setSpeakerTime] = useState(0);
+  const [speakerZoom, setSpeakerZoom] = useState(3);
+  const [galleryTime, setGalleryTime] = useState(0);
+  const [galleryZoom, setGalleryZoom] = useState(3);
+
+  // Same fit formula as StandardTimeline's own "Celé video" button
+  // (viewport / duration), just computed upfront so the tracks aren't
+  // squashed into a sliver on first render.
+  useEffect(() => { setSpeakerZoom(Math.max(0.04, 860 / Math.max(60, speakerDur))); }, [speakerDur]);
+  useEffect(() => { if (galleryDur) setGalleryZoom(Math.max(0.04, 860 / Math.max(60, galleryDur))); }, [galleryDur]);
+
+  if (!plan.length) return null;
+
+  const kindFor = (kind) => kind === 'gallery' ? 'gallery' : (kind === 'speaker_hero' ? 'speaker' : 'replacement');
+  const toActions = (items) => items.map(it => ({
+    id: it.id,
+    effectId: 'video_clip',
+    kind: kindFor(it.kind),
+    role: it.role,
+    title: it.label,
+    start: it.start,
+    end: it.start + it.duration,
+    movable: true,
+    flexible: false,
+    fixedDuration: true,
+  }));
+
+  const applyRowsUpdate = (role, rows) => {
+    const updated = Object.fromEntries((rows[0]?.actions || []).map(a => [a.id, a]));
+    const nextPlan = plan.map(item => {
+      if (item.role !== role) return item;
+      const upd = updated[item.id];
+      if (!upd) return item;
+      return {...item, start: Math.max(0, Number(upd.start || 0))};
+    });
+    setProject({...project, analysis: {...(project.analysis || {}), social_clip: {...social, plan: nextPlan}}});
+  };
+
+  const speakerRows = [{id: 'social_speaker', title: 'Hlavní video', subtitle: 'úvodní záběr + prezentace; táhni pro výběr jiné části', actions: toActions(speakerItems)}];
+  const galleryRows = [{id: 'social_gallery', title: 'Galerie', subtitle: 'záběry galerie; táhni pro výběr jiné části', actions: toActions(galleryItems)}];
+
+  return <div className="socialClipTimelines">
+    <p className="muted shortcutHint">Přetažením bloku vyber jinou část videa pro daný záběr. Změna se projeví ve finálním vzorku až po kliknutí na „Přegenerovat vzorek“.</p>
+    <div className="socialTimelineBlock">
+      <strong>Hlavní video (řečník + prezentace)</strong>
+      <StandardTimeline rows={speakerRows} duration={speakerDur} pxPerSecond={speakerZoom} setPxPerSecond={setSpeakerZoom} time={speakerTime} setTime={setSpeakerTime} onRowsChange={(rows) => applyRowsUpdate('speaker_video', rows)} onSelect={() => {}} log={() => {}} />
+    </div>
+    {galleryItems.length > 0 && <div className="socialTimelineBlock">
+      <strong>Galerie</strong>
+      <StandardTimeline rows={galleryRows} duration={galleryDur} pxPerSecond={galleryZoom} setPxPerSecond={setGalleryZoom} time={galleryTime} setTime={setGalleryTime} onRowsChange={(rows) => applyRowsUpdate('gallery_video', rows)} onSelect={() => {}} log={() => {}} />
+    </div>}
+  </div>;
+}
+
+function SocialClipSection({project, setProject, generateSocialClip, busy, busyAction}) {
   const canGenerate = Boolean(project?.files?.speaker_video);
   const hasGallery = Boolean(project?.files?.gallery_video);
   const info = project?.analysis?.social_clip;
+  const hasPlan = Boolean(info?.plan?.length);
   const clipFile = project?.files?.social_clip_video;
   const clipUrl = clipFile ? `/api/source_video?project=${encodeURIComponent(project.id)}&role=social_clip_video&_=${encodeURIComponent(info?.created_at || clipFile)}` : null;
   return <section className="card socialClipStep">
@@ -1317,12 +1380,15 @@ function SocialClipSection({project, generateSocialClip, busy, busyAction}) {
       ? <p className="muted">Použije hlavní video{hasGallery ? ' a galerii' : ''} podle aktuálních střihových bodů (začátek po trimu{hasGallery ? ', přechod do galerie' : ''}).</p>
       : <p className="muted">Nejdřív v sekci 1 načti hlavní video.</p>}
     <div className="actions">
-      <button className="render" onClick={generateSocialClip} disabled={busy || !canGenerate}>{busyAction === 'socialClip' ? 'Generuji vzorek…' : 'Vygenerovat vzorek pro sociální sítě'}</button>
+      <button className="render" onClick={generateSocialClip} disabled={busy || !canGenerate}>
+        {busyAction === 'socialClip' ? 'Generuji vzorek…' : (hasPlan ? 'Přegenerovat vzorek pro sociální sítě' : 'Vygenerovat vzorek pro sociální sítě')}
+      </button>
     </div>
     {clipUrl && <div className="socialClipPreview">
       <video className="socialClipVideo" src={clipUrl} controls />
       {info && <p className="muted">Délka {fmt(info.duration)} · {info.clips} záběrů{info.has_gallery ? ' (včetně galerie)' : ''}</p>}
     </div>}
+    {hasPlan && <SocialClipTimeline project={project} setProject={setProject} />}
   </section>;
 }
 
@@ -1561,7 +1627,7 @@ function App() {
         <EditVideoStep project={project} saveProject={saveProject} prepareEditVideo={prepareEditVideo} fullAuto={fullAuto} exportAudio={exportAudio} importAudio={importAudio} optimizeVideo={optimizeVideo} deleteSilences={deleteSilences} adjustAudio={adjustAudio} setProject={setProject} busy={busy} busyAction={busyAction} />
         <SilenceAnalysisSection project={project} />
         <FinalRenderSection project={project} renderProject={renderProject} busy={busy} busyAction={busyAction} />
-        <SocialClipSection project={project} generateSocialClip={generateSocialClip} busy={busy} busyAction={busyAction} />
+        <SocialClipSection project={project} setProject={setProject} generateSocialClip={generateSocialClip} busy={busy} busyAction={busyAction} />
         <LogPanel lines={lines} />
       </>}
     </main>

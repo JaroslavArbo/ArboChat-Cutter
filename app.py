@@ -2865,11 +2865,92 @@ def _xfade_concat(clip_paths, final, work, transition_duration=0.5, transitions=
     return final
 
 
+def _social_clip_auto_plan(gallery_available, speaker_dur, gallery_dur, real, main_end):
+    """Compute the automatic cutaway plan: a list of dicts (id/kind/role/label/
+    start/duration/transition) for every source-video cutaway used in the social
+    clip. Excludes the generated title card and the shared outro brand card,
+    since those aren't source-video regions a user can drag on a timeline.
+    """
+    main_span = max(0.0, main_end - real)
+    plan = []
+
+    hero_start = real + (1.5 if main_span > 3 else 0)
+    hero_dur = min(9.0, max(3.0, main_span * 0.25)) if main_span > 0 else 3.0
+    plan.append({"id": "hero", "kind": "speaker_hero", "role": "speaker_video",
+                 "label": "Řečník (úvodní záběr)", "start": hero_start, "duration": hero_dur, "transition": "fade"})
+
+    remaining_start = hero_start + hero_dur + 1.0
+    remaining_span = max(0.0, main_end - remaining_start)
+    presentation_count = 3 if remaining_span > 15 else (2 if remaining_span > 8 else (1 if remaining_span > 3 else 0))
+    presentation_trans = ["dissolve", "smoothleft", "fade"]
+    if presentation_count:
+        slot = remaining_span / presentation_count
+        clip_dur = min(7.0, max(2.5, slot * 0.55))
+        for i in range(presentation_count):
+            t0 = remaining_start + slot * i + slot * 0.2
+            plan.append({"id": f"presentation_{i}", "kind": "presentation", "role": "speaker_video",
+                         "label": f"Prezentace {i + 1}", "start": t0, "duration": clip_dur,
+                         "transition": presentation_trans[i % len(presentation_trans)]})
+
+    if gallery_available:
+        gallery_count = 4 if gallery_dur > 40 else (3 if gallery_dur > 20 else (2 if gallery_dur > 8 else 1))
+        gallery_trans = ["smoothright", "dissolve", "fade", "smoothleft"]
+        margin = min(3.0, gallery_dur * 0.08)
+        usable = max(0.0, gallery_dur - margin * 2)
+        slot = usable / gallery_count if gallery_count else 0
+        clip_dur = min(6.0, max(2.5, slot * 0.6)) if slot else 0
+        for i in range(gallery_count):
+            t0 = margin + slot * i + slot * 0.15
+            plan.append({"id": f"gallery_{i}", "kind": "gallery", "role": "gallery_video",
+                         "label": f"Galerie {i + 1}", "start": t0, "duration": clip_dur,
+                         "transition": gallery_trans[i % len(gallery_trans)]})
+    elif remaining_span > 3 and presentation_count < 3:
+        # No gallery footage: one more presentation cutaway so the reel still runs close to a minute.
+        t0 = remaining_start + remaining_span * 0.7
+        plan.append({"id": f"presentation_{presentation_count}", "kind": "presentation", "role": "speaker_video",
+                     "label": f"Prezentace {presentation_count + 1}", "start": t0,
+                     "duration": min(7.0, max(2.5, remaining_span * 0.25)), "transition": "dissolve"})
+    return plan
+
+
+def _reconcile_social_plan(auto_plan, existing_plan, duration_by_role):
+    """Keep a user's dragged start positions across a re-generate, as long as the
+    freshly computed plan still has the same shape (same ids/kinds/roles in the
+    same order). If the shape changed (different file, different cut points that
+    add/remove a cutaway), the stale edits are discarded in favor of the fresh
+    automatic plan rather than silently applied to the wrong slot.
+    """
+    if not isinstance(existing_plan, list) or len(existing_plan) != len(auto_plan):
+        return auto_plan
+    existing_by_id = {str(it.get("id")): it for it in existing_plan if isinstance(it, dict)}
+    reconciled = []
+    for item in auto_plan:
+        prev = existing_by_id.get(item["id"])
+        if not prev or prev.get("kind") != item["kind"] or prev.get("role") != item["role"]:
+            return auto_plan
+        new_item = dict(item)
+        try:
+            start = float(prev.get("start", item["start"]))
+        except Exception:
+            start = item["start"]
+        total = float(duration_by_role.get(item["role"]) or 0)
+        max_start = max(0.0, total - item["duration"]) if total else start
+        new_item["start"] = max(0.0, min(start, max_start)) if total else max(0.0, start)
+        reconciled.append(new_item)
+    return reconciled
+
+
 def _generate_social_clip(pid):
     """Build a ~1 minute vertical (9:16) highlight reel for Facebook/LinkedIn:
     a generated title card, a speaker close-up, a few presentation cutaways from
     later in the talk, and (if available) several gallery/discussion cutaways,
     joined with subtle, professional crossfades rather than hard cuts.
+
+    Which source moment each cutaway uses is an explicit, editable "plan" saved
+    into the project (analysis.social_clip.plan) so the frontend can show it on
+    a timeline and let a user drag a cutaway to a different moment; regenerating
+    reuses those positions (see _reconcile_social_plan) instead of recomputing
+    fresh ones every time.
     """
     cfg = project_config(pid)
     cfg = _recover_project_files_from_folder(cfg)
@@ -2882,13 +2963,17 @@ def _generate_social_clip(pid):
 
     speaker_dur = float(ffprobe(speaker).get("duration") or 0)
     gallery_dur = float(ffprobe(gallery).get("duration") or 0) if gallery and Path(gallery).exists() else 0
+    has_gallery = bool(gallery and Path(gallery).exists() and gallery_dur > 1.0)
 
     real = max(0.0, _seconds(cuts.get("real_start"), 0))
     discussion = _seconds(cuts.get("discussion_start") if cuts.get("discussion_start") is not None else cuts.get("gallery_start"), -1)
     main_end = discussion if (discussion >= 0 and discussion > real) else speaker_dur
     if speaker_dur > 0:
         main_end = min(main_end, speaker_dur)
-    main_span = max(0.0, main_end - real)
+
+    auto_plan = _social_clip_auto_plan(has_gallery, speaker_dur, gallery_dur, real, main_end)
+    existing_plan = cfg.get("analysis", {}).get("social_clip", {}).get("plan")
+    plan = _reconcile_social_plan(auto_plan, existing_plan, {"speaker_video": speaker_dur, "gallery_video": gallery_dur})
 
     work = project_dir(pid) / "work" / "social_clip"
     work.mkdir(parents=True, exist_ok=True)
@@ -2906,45 +2991,21 @@ def _generate_social_clip(pid):
             clips.append(path_or_none)
 
     # 1) Generated title card: episode number, topic and speaker.
+    main_span = max(0.0, main_end - real)
     bg_time = real + min(4.0, main_span * 0.15) if main_span > 0 else 0.0
     add(_social_title_card(cfg, work / "000_title.mp4", duration=4.0, background_src=speaker, background_time=bg_time))
 
-    # 2) Speaker close-up near the start of the talk.
-    hero_start = real + (1.5 if main_span > 3 else 0)
-    hero_dur = min(9.0, max(3.0, main_span * 0.25)) if main_span > 0 else 3.0
-    add(_vertical_normalized_segment(speaker, hero_start, hero_dur, work / "001_speaker.mp4"), "fade")
-
-    # 3) A few presentation cutaways spread across the rest of the talk.
-    remaining_start = hero_start + hero_dur + 1.0
-    remaining_span = max(0.0, main_end - remaining_start)
-    presentation_count = 3 if remaining_span > 15 else (2 if remaining_span > 8 else (1 if remaining_span > 3 else 0))
-    presentation_trans = ["dissolve", "smoothleft", "fade"]
-    if presentation_count:
-        slot = remaining_span / presentation_count
-        clip_dur = min(7.0, max(2.5, slot * 0.55))
-        for i in range(presentation_count):
-            t0 = remaining_start + slot * i + slot * 0.2
-            add(_vertical_normalized_segment(speaker, t0, clip_dur, work / f"{len(clips):03d}_presentation.mp4"),
-                presentation_trans[i % len(presentation_trans)])
-
-    # 4) Gallery/discussion cutaways sampled across the gallery clip's own timeline.
-    has_gallery = bool(gallery and Path(gallery).exists() and gallery_dur > 1.0)
-    if has_gallery:
-        gallery_count = 4 if gallery_dur > 40 else (3 if gallery_dur > 20 else (2 if gallery_dur > 8 else 1))
-        gallery_trans = ["smoothright", "dissolve", "fade", "smoothleft"]
-        margin = min(3.0, gallery_dur * 0.08)
-        usable = max(0.0, gallery_dur - margin * 2)
-        slot = usable / gallery_count if gallery_count else 0
-        clip_dur = min(6.0, max(2.5, slot * 0.6)) if slot else 0
-        for i in range(gallery_count):
-            t0 = margin + slot * i + slot * 0.15
-            add(_vertical_normalized_segment(gallery, t0, clip_dur, work / f"{len(clips):03d}_gallery.mp4"),
-                gallery_trans[i % len(gallery_trans)])
-    elif remaining_span > 3 and presentation_count < 3:
-        # No gallery footage: one more presentation cutaway so the reel still runs close to a minute.
-        t0 = remaining_start + remaining_span * 0.7
-        add(_vertical_normalized_segment(speaker, t0, min(7.0, max(2.5, remaining_span * 0.25)),
-            work / f"{len(clips):03d}_presentation.mp4"), "dissolve")
+    # 2)-4) Source cutaways from the (possibly user-edited) plan.
+    used_plan = []
+    for item in plan:
+        src = speaker if item.get("role") == "speaker_video" else gallery
+        if not src or not Path(src).exists():
+            continue
+        target = work / f"{len(clips):03d}_{item.get('kind', 'clip')}.mp4"
+        seg = _vertical_normalized_segment(src, item.get("start", 0), item.get("duration", 0), target)
+        if seg:
+            add(seg, item.get("transition", "fade"))
+            used_plan.append(item)
 
     # 5) Optional closing brand card from the shared outro template.
     settings = load_settings()
@@ -2965,6 +3026,9 @@ def _generate_social_clip(pid):
         "duration": float(ffprobe(final).get("duration") or 0),
         "clips": len(clips),
         "has_gallery": has_gallery,
+        "plan": used_plan,
+        "speaker_duration": speaker_dur,
+        "gallery_duration": gallery_dur,
     }
     save_project(cfg)
     return cfg
